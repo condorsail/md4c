@@ -1,0 +1,34 @@
+[package]
+name = "ratatui-md"
+version = "0.1.0"
+edition = "2021"
+authors = ["MD4C Contributors"]
+description = "Markdown rendering for ratatui terminal UIs using MD4C"
+license = "MIT"
+repository = "https://github.com/mity/md4c"
+keywords = ["markdown", "ratatui", "terminal", "tui", "md4c"]
+categories = ["command-line-interface", "text-processing"]
+readme = "README.md"
+
+[dependencies]
+md4c = { path = "../md4c-rs" }
+ratatui = "0.29"
+unicode-width = "0.2"
+
+# Optional: syntax highlighting for code blocks
+syntect = { version = "5.2", optional = true, default-features = false, features = ["default-fancy"] }
+
+[dev-dependencies]
+crossterm = "0.28"
+
+[features]
+default = []
+syntect = ["dep:syntect"]
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+
+[[example]]
+name = "scrollable"
+path = "examples/scrollable.rs"
