@@ -1,0 +1,25 @@
+[package]
+name = "md4c"
+version = "0.5.2"
+edition = "2021"
+authors = ["MD4C Contributors"]
+description = "Rust bindings for MD4C, a fast CommonMark-compliant Markdown parser"
+license = "MIT"
+repository = "https://github.com/mity/md4c"
+keywords = ["markdown", "parser", "commonmark", "md4c"]
+categories = ["parsing", "text-processing"]
+readme = "README.md"
+
+[build-dependencies]
+cc = "1.0"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "parsing"
+harness = false
+
+[features]
+default = ["html"]
+html = []
