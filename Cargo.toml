@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "md4c-rs",
+    "ratatui-md",
+]
+
+[workspace.package]
+version = "0.5.2"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/mity/md4c"

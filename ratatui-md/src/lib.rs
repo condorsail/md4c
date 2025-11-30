@@ -116,7 +116,7 @@ pub mod widget;
 
 // Re-export main types
 pub use highlight::SyntaxHighlighter;
-pub use renderer::{render, render_default, HeadingInfo, LinkInfo, RenderOptions, RenderedMarkdown};
+pub use renderer::{render, render_default, HeadingInfo, LinkInfo, RenderOptions, RenderedMarkdown, SearchMatch};
 pub use theme::Theme;
 pub use widget::{Markdown, MarkdownSpan, MarkdownView, MarkdownViewWidget};
 
