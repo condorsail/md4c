@@ -2,7 +2,7 @@
 //!
 //! Provides ready-to-use widgets for rendering markdown in terminal UIs.
 
-use crate::renderer::{render, HeadingInfo, LinkInfo, RenderOptions, RenderedMarkdown};
+use crate::renderer::{render, HeadingInfo, LinkInfo, RenderOptions, RenderedMarkdown, SearchMatch};
 use crate::theme::Theme;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
@@ -308,6 +308,104 @@ impl MarkdownView {
         self.ensure_rendered();
         MarkdownViewWidget { view: self }
     }
+
+    /// Set a search pattern to highlight.
+    ///
+    /// Matches are case-insensitive and will be highlighted in the rendered output.
+    pub fn set_search(&mut self, pattern: impl Into<String>) {
+        self.options.search_pattern = Some(pattern.into());
+        self.rendered = None; // Invalidate cache
+    }
+
+    /// Clear the search pattern.
+    pub fn clear_search(&mut self) {
+        self.options.search_pattern = None;
+        self.rendered = None;
+    }
+
+    /// Get the current search pattern.
+    pub fn search_pattern(&self) -> Option<&str> {
+        self.options.search_pattern.as_deref()
+    }
+
+    /// Get all search matches.
+    pub fn search_matches(&mut self) -> Vec<SearchMatch> {
+        self.ensure_rendered();
+        self.rendered
+            .as_ref()
+            .map(|r| r.search_matches.clone())
+            .unwrap_or_default()
+    }
+
+    /// Get the number of search matches.
+    pub fn search_match_count(&mut self) -> usize {
+        self.ensure_rendered();
+        self.rendered
+            .as_ref()
+            .map(|r| r.search_matches.len())
+            .unwrap_or(0)
+    }
+
+    /// Scroll to the next search match from the current scroll position.
+    ///
+    /// Returns the index of the match scrolled to, or None if no matches.
+    pub fn scroll_to_next_match(&mut self) -> Option<usize> {
+        self.ensure_rendered();
+        let matches = self.rendered.as_ref()?.search_matches.clone();
+        if matches.is_empty() {
+            return None;
+        }
+
+        let current_line = self.scroll_offset as usize;
+
+        // Find the next match after current position
+        for (i, m) in matches.iter().enumerate() {
+            if m.line > current_line {
+                self.scroll_offset = m.line as u16;
+                return Some(i);
+            }
+        }
+
+        // Wrap around to first match
+        self.scroll_offset = matches[0].line as u16;
+        Some(0)
+    }
+
+    /// Scroll to the previous search match from the current scroll position.
+    ///
+    /// Returns the index of the match scrolled to, or None if no matches.
+    pub fn scroll_to_prev_match(&mut self) -> Option<usize> {
+        self.ensure_rendered();
+        let matches = self.rendered.as_ref()?.search_matches.clone();
+        if matches.is_empty() {
+            return None;
+        }
+
+        let current_line = self.scroll_offset as usize;
+
+        // Find the previous match before current position
+        for (i, m) in matches.iter().enumerate().rev() {
+            if m.line < current_line {
+                self.scroll_offset = m.line as u16;
+                return Some(i);
+            }
+        }
+
+        // Wrap around to last match
+        let last = matches.len() - 1;
+        self.scroll_offset = matches[last].line as u16;
+        Some(last)
+    }
+
+    /// Scroll to a specific search match by index.
+    pub fn scroll_to_match(&mut self, index: usize) {
+        self.ensure_rendered();
+        if let Some(ref rendered) = self.rendered {
+            if let Some(m) = rendered.search_matches.get(index) {
+                self.scroll_offset = m.line as u16;
+            }
+        }
+    }
 }
 
 /// Widget wrapper for MarkdownView.
@@ -414,5 +512,27 @@ mod tests {
         let mut view = MarkdownView::new("[a](http://a.com) and [b](http://b.com)");
         let links = view.links();
         assert_eq!(links.len(), 2);
+    }
+
+    #[test]
+    fn test_markdown_view_search() {
+        let mut view = MarkdownView::new("Hello world\n\nHello again\n\nGoodbye");
+        view.set_search("hello");
+        let matches = view.search_matches();
+        assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn test_markdown_view_search_navigation() {
+        let mut view = MarkdownView::new("Hello\n\nworld\n\nHello\n\nagain");
+        view.set_search("hello");
+
+        // Jump to first match
+        let idx = view.scroll_to_next_match();
+        assert!(idx.is_some());
+
+        // Clear and check
+        view.clear_search();
+        assert!(view.search_pattern().is_none());
     }
 }

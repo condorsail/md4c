@@ -3,16 +3,19 @@
 //! Converts parsed markdown into ratatui `Text` structures.
 
 use crate::theme::Theme;
+#[cfg(feature = "syntect")]
+use crate::highlight::SyntaxHighlighter;
 use md4c::{
     parse, Alignment, Block, BlockType, CodeBlockDetail, HeadingDetail, ImageDetail, LinkDetail,
     ListItemDetail, OrderedListDetail, ParserFlags, ParserHandler, Span, SpanType, TableCellDetail,
     TableDetail, TaskState, TextType, UnorderedListDetail, WikiLinkDetail,
 };
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span as RSpan, Text};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Render options for the markdown renderer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RenderOptions {
     /// Maximum width for wrapping (0 = no wrapping)
     pub width: usize,
@@ -26,10 +29,19 @@ pub struct RenderOptions {
     pub code_block_space: bool,
     /// Whether to include a blank line after lists
     pub list_space: bool,
+    /// Search pattern to highlight (case-insensitive)
+    pub search_pattern: Option<String>,
+    /// Style for search highlights
+    pub search_highlight_style: Style,
+    /// Whether to use syntax highlighting for code blocks
+    pub syntax_highlighting: bool,
+    /// Syntax highlighting theme name (if syntect feature enabled)
+    pub syntax_theme: Option<String>,
 }
 
-impl Default for RenderOptions {
-    fn default() -> Self {
+impl RenderOptions {
+    /// Create a new RenderOptions with defaults.
+    pub fn new() -> Self {
         Self {
             width: 0,
             parser_flags: ParserFlags::github(),
@@ -37,16 +49,21 @@ impl Default for RenderOptions {
             paragraph_space: true,
             code_block_space: true,
             list_space: true,
+            search_pattern: None,
+            search_highlight_style: Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+            syntax_highlighting: true,
+            syntax_theme: None,
         }
     }
-}
 
-impl RenderOptions {
     /// Create options with CommonMark parsing.
     pub fn commonmark() -> Self {
         Self {
             parser_flags: ParserFlags::commonmark(),
-            ..Default::default()
+            ..Self::new()
         }
     }
 
@@ -54,7 +71,7 @@ impl RenderOptions {
     pub fn github() -> Self {
         Self {
             parser_flags: ParserFlags::github(),
-            ..Default::default()
+            ..Self::new()
         }
     }
 
@@ -67,6 +84,36 @@ impl RenderOptions {
     /// Set parser flags.
     pub fn with_parser_flags(mut self, flags: ParserFlags) -> Self {
         self.parser_flags = flags;
+        self
+    }
+
+    /// Set a search pattern to highlight.
+    pub fn with_search(mut self, pattern: impl Into<String>) -> Self {
+        self.search_pattern = Some(pattern.into());
+        self
+    }
+
+    /// Clear the search pattern.
+    pub fn clear_search(mut self) -> Self {
+        self.search_pattern = None;
+        self
+    }
+
+    /// Set the search highlight style.
+    pub fn with_search_style(mut self, style: Style) -> Self {
+        self.search_highlight_style = style;
+        self
+    }
+
+    /// Enable or disable syntax highlighting.
+    pub fn with_syntax_highlighting(mut self, enabled: bool) -> Self {
+        self.syntax_highlighting = enabled;
+        self
+    }
+
+    /// Set the syntax highlighting theme.
+    pub fn with_syntax_theme(mut self, theme: impl Into<String>) -> Self {
+        self.syntax_theme = Some(theme.into());
         self
     }
 }
@@ -85,6 +132,8 @@ pub struct RenderedMarkdown<'a> {
     pub headings: Vec<HeadingInfo>,
     /// Total line count
     pub line_count: usize,
+    /// Search match locations: (line_index, start_col, end_col)
+    pub search_matches: Vec<SearchMatch>,
 }
 
 /// Information about a link in the rendered document.
@@ -111,16 +160,168 @@ pub struct HeadingInfo {
     pub text: String,
 }
 
+/// Information about a search match.
+#[derive(Debug, Clone)]
+pub struct SearchMatch {
+    /// Line index
+    pub line: usize,
+    /// Start column (character index)
+    pub start: usize,
+    /// End column (character index)
+    pub end: usize,
+}
+
+/// Word wrap a line of spans to fit within the given width.
+fn wrap_line(spans: Vec<RSpan<'static>>, max_width: usize, indent: usize) -> Vec<Line<'static>> {
+    if max_width == 0 {
+        return vec![Line::from(spans)];
+    }
+
+    let mut result = Vec::new();
+    let mut current_line: Vec<RSpan<'static>> = Vec::new();
+    let mut current_width = 0;
+    let indent_str = " ".repeat(indent);
+
+    for span in spans {
+        let text = span.content.to_string();
+        let style = span.style;
+        let mut remaining = text.as_str();
+
+        while !remaining.is_empty() {
+            let span_width = remaining.width();
+
+            if current_width + span_width <= max_width {
+                // Fits on current line
+                current_line.push(RSpan::styled(remaining.to_string(), style));
+                current_width += span_width;
+                break;
+            }
+
+            // Need to wrap
+            let available = max_width.saturating_sub(current_width);
+            if available == 0 {
+                // Start new line
+                if !current_line.is_empty() {
+                    result.push(Line::from(std::mem::take(&mut current_line)));
+                }
+                current_line.push(RSpan::raw(indent_str.clone()));
+                current_width = indent;
+                continue;
+            }
+
+            // Find wrap point
+            let mut wrap_at = 0;
+            let mut width_so_far = 0;
+            let mut last_space = None;
+
+            for (i, c) in remaining.char_indices() {
+                let char_width = c.width().unwrap_or(1);
+                if width_so_far + char_width > available {
+                    break;
+                }
+                width_so_far += char_width;
+                wrap_at = i + c.len_utf8();
+                if c.is_whitespace() {
+                    last_space = Some(i);
+                }
+            }
+
+            // Prefer wrapping at word boundary
+            let break_at = if let Some(space_pos) = last_space {
+                if space_pos > 0 {
+                    space_pos
+                } else {
+                    wrap_at
+                }
+            } else if wrap_at > 0 {
+                wrap_at
+            } else {
+                // Can't fit even one character, force break
+                remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(1)
+            };
+
+            let (before, after) = remaining.split_at(break_at);
+            if !before.is_empty() {
+                current_line.push(RSpan::styled(before.to_string(), style));
+            }
+
+            // Start new line
+            result.push(Line::from(std::mem::take(&mut current_line)));
+            current_line.push(RSpan::raw(indent_str.clone()));
+            current_width = indent;
+
+            // Skip leading whitespace on new line
+            remaining = after.trim_start();
+        }
+    }
+
+    if !current_line.is_empty() {
+        result.push(Line::from(current_line));
+    }
+
+    if result.is_empty() {
+        result.push(Line::from(vec![]));
+    }
+
+    result
+}
+
+/// Apply search highlighting to spans.
+fn highlight_search(spans: Vec<RSpan<'static>>, pattern: &str, style: Style) -> (Vec<RSpan<'static>>, Vec<(usize, usize)>) {
+    if pattern.is_empty() {
+        return (spans, vec![]);
+    }
+
+    let pattern_lower = pattern.to_lowercase();
+    let mut result = Vec::new();
+    let mut matches = Vec::new();
+    let mut char_offset = 0;
+
+    for span in spans {
+        let text = span.content.to_string();
+        let text_lower = text.to_lowercase();
+        let base_style = span.style;
+
+        let mut last_end = 0;
+        for (match_start, _) in text_lower.match_indices(&pattern_lower) {
+            let match_end = match_start + pattern.len();
+
+            // Add non-matching part before
+            if match_start > last_end {
+                result.push(RSpan::styled(text[last_end..match_start].to_string(), base_style));
+            }
+
+            // Add matching part with highlight
+            result.push(RSpan::styled(text[match_start..match_end].to_string(), style));
+            matches.push((char_offset + match_start, char_offset + match_end));
+
+            last_end = match_end;
+        }
+
+        // Add remaining non-matching part
+        if last_end < text.len() {
+            result.push(RSpan::styled(text[last_end..].to_string(), base_style));
+        }
+
+        char_offset += text.len();
+    }
+
+    (result, matches)
+}
+
 /// Internal state for the renderer.
 struct RendererState<'a> {
     theme: &'a Theme,
     options: &'a RenderOptions,
+    #[cfg(feature = "syntect")]
+    highlighter: Option<SyntaxHighlighter>,
 
     // Output
     lines: Vec<Line<'static>>,
     current_spans: Vec<RSpan<'static>>,
     links: Vec<LinkInfo>,
     headings: Vec<HeadingInfo>,
+    search_matches: Vec<SearchMatch>,
 
     // Style stack for nested formatting
     style_stack: Vec<Style>,
@@ -130,6 +331,7 @@ struct RendererState<'a> {
     in_blockquote: bool,
     in_code_block: bool,
     code_block_lang: String,
+    code_block_content: String,
     in_list: bool,
     list_depth: usize,
     list_counters: Vec<u32>,
@@ -155,18 +357,33 @@ struct RendererState<'a> {
 
 impl<'a> RendererState<'a> {
     fn new(theme: &'a Theme, options: &'a RenderOptions) -> Self {
+        #[cfg(feature = "syntect")]
+        let highlighter = if options.syntax_highlighting {
+            let mut h = SyntaxHighlighter::new();
+            if let Some(ref theme_name) = options.syntax_theme {
+                h = h.theme(theme_name);
+            }
+            Some(h)
+        } else {
+            None
+        };
+
         Self {
             theme,
             options,
+            #[cfg(feature = "syntect")]
+            highlighter,
             lines: Vec::new(),
             current_spans: Vec::new(),
             links: Vec::new(),
             headings: Vec::new(),
+            search_matches: Vec::new(),
             style_stack: vec![theme.text],
             in_heading: None,
             in_blockquote: false,
             in_code_block: false,
             code_block_lang: String::new(),
+            code_block_content: String::new(),
             in_list: false,
             list_depth: 0,
             list_counters: Vec::new(),
@@ -190,7 +407,6 @@ impl<'a> RendererState<'a> {
     }
 
     fn push_style(&mut self, style: Style) {
-        // Merge with current style
         let current = self.current_style();
         let merged = current.patch(style);
         self.style_stack.push(merged);
@@ -207,13 +423,18 @@ impl<'a> RendererState<'a> {
             return;
         }
 
+        // Handle code block content collection
+        if self.in_code_block {
+            self.code_block_content.push_str(text);
+            return;
+        }
+
         if self.in_table {
             self.current_table_cell
                 .push(RSpan::styled(text.to_string(), self.current_style()));
             return;
         }
 
-        // Track link text
         if self.current_link.is_some() {
             self.current_link_text.push_str(text);
         }
@@ -223,7 +444,11 @@ impl<'a> RendererState<'a> {
     }
 
     fn finish_line(&mut self) {
-        if self.in_table {
+        self.finish_line_with_wrap(0);
+    }
+
+    fn finish_line_with_wrap(&mut self, indent: usize) {
+        if self.in_table || self.in_code_block {
             return;
         }
 
@@ -240,10 +465,33 @@ impl<'a> RendererState<'a> {
             );
         }
 
-        if !spans.is_empty() || self.pending_newline {
-            self.lines.push(Line::from(spans));
-            self.pending_newline = false;
+        if spans.is_empty() && !self.pending_newline {
+            return;
         }
+
+        // Apply search highlighting
+        if let Some(ref pattern) = self.options.search_pattern {
+            let line_idx = self.lines.len();
+            let (highlighted_spans, matches) = highlight_search(spans, pattern, self.options.search_highlight_style);
+            spans = highlighted_spans;
+            for (start, end) in matches {
+                self.search_matches.push(SearchMatch {
+                    line: line_idx,
+                    start,
+                    end,
+                });
+            }
+        }
+
+        // Apply word wrapping
+        if self.options.width > 0 && !spans.is_empty() {
+            let wrapped = wrap_line(spans, self.options.width, indent);
+            self.lines.extend(wrapped);
+        } else {
+            self.lines.push(Line::from(spans));
+        }
+
+        self.pending_newline = false;
     }
 
     fn add_blank_line(&mut self) {
@@ -254,7 +502,6 @@ impl<'a> RendererState<'a> {
     fn get_list_prefix(&mut self) -> String {
         let indent = " ".repeat(self.list_depth.saturating_sub(1) * self.theme.list_indent);
 
-        // Handle task lists
         if let Some(task_state) = self.current_task_state.take() {
             let marker = match task_state {
                 TaskState::Checked => self.theme.task_checked_char,
@@ -288,28 +535,62 @@ impl<'a> RendererState<'a> {
             .push(Line::from(vec![RSpan::styled(hr, self.theme.horizontal_rule)]));
     }
 
+    fn render_code_block(&mut self) {
+        let content = std::mem::take(&mut self.code_block_content);
+        #[allow(unused_variables)]
+        let lang = std::mem::take(&mut self.code_block_lang);
+
+        #[cfg(feature = "syntect")]
+        if let Some(ref highlighter) = self.highlighter {
+            if !lang.is_empty() {
+                let highlighted_lines = highlighter.highlight(&content, &lang);
+                self.lines.extend(highlighted_lines);
+                return;
+            }
+        }
+
+        // Fallback: render without highlighting
+        for line in content.lines() {
+            let mut spans = vec![RSpan::styled(line.to_string(), self.theme.code_block)];
+
+            // Apply search highlighting to code
+            if let Some(ref pattern) = self.options.search_pattern {
+                let line_idx = self.lines.len();
+                let (highlighted, matches) = highlight_search(spans, pattern, self.options.search_highlight_style);
+                spans = highlighted;
+                for (start, end) in matches {
+                    self.search_matches.push(SearchMatch {
+                        line: line_idx,
+                        start,
+                        end,
+                    });
+                }
+            }
+
+            self.lines.push(Line::from(spans));
+        }
+    }
+
     fn render_table(&mut self) {
         if self.table_rows.is_empty() {
             return;
         }
 
-        // Calculate column widths
         let mut col_widths: Vec<usize> = vec![0; self.table_columns];
         for row in &self.table_rows {
             for (i, cell) in row.iter().enumerate() {
                 if i < col_widths.len() {
-                    let cell_width: usize = cell.iter().map(|s| s.content.len()).sum();
+                    let cell_width: usize = cell.iter().map(|s| s.content.width()).sum();
                     col_widths[i] = col_widths[i].max(cell_width);
                 }
             }
         }
 
-        // Ensure minimum width
         for w in &mut col_widths {
             *w = (*w).max(3);
         }
 
-        // Render top border
+        // Top border
         let top_border: String = col_widths
             .iter()
             .map(|w| "─".repeat(*w + 2))
@@ -320,7 +601,7 @@ impl<'a> RendererState<'a> {
             self.theme.table_border,
         )]));
 
-        // Render rows
+        // Rows
         for (row_idx, row) in self.table_rows.iter().enumerate() {
             let mut line_spans = vec![RSpan::styled("│ ".to_string(), self.theme.table_border)];
 
@@ -347,7 +628,6 @@ impl<'a> RendererState<'a> {
 
             self.lines.push(Line::from(line_spans));
 
-            // Add separator after header
             if row_idx == 0 {
                 let sep: String = col_widths
                     .iter()
@@ -370,7 +650,7 @@ impl<'a> RendererState<'a> {
             }
         }
 
-        // Render bottom border
+        // Bottom border
         let bottom_border: String = col_widths
             .iter()
             .map(|w| "─".repeat(*w + 2))
@@ -381,7 +661,6 @@ impl<'a> RendererState<'a> {
             self.theme.table_border,
         )]));
 
-        // Clear table state
         self.table_rows.clear();
         self.table_columns = 0;
         self.table_alignments.clear();
@@ -394,7 +673,6 @@ impl ParserHandler for RendererState<'_> {
             Block::Document => {}
 
             Block::Paragraph => {
-                // Add list prefix at start of list item paragraph
                 if self.in_list && self.list_depth > 0 {
                     let prefix = self.get_list_prefix();
                     if !prefix.is_empty() {
@@ -412,7 +690,6 @@ impl ParserHandler for RendererState<'_> {
                 self.in_heading = Some(level);
                 self.push_style(self.theme.heading_style(level));
 
-                // Add heading prefix (optional)
                 let prefix = "#".repeat(level as usize);
                 self.current_spans.push(RSpan::styled(
                     format!("{} ", prefix),
@@ -428,8 +705,8 @@ impl ParserHandler for RendererState<'_> {
             Block::Code(CodeBlockDetail { lang, .. }) => {
                 self.in_code_block = true;
                 self.code_block_lang = lang.clone();
+                self.code_block_content.clear();
 
-                // Show language label if present
                 if !lang.is_empty() {
                     self.lines.push(Line::from(vec![RSpan::styled(
                         format!("{}:", lang),
@@ -488,7 +765,6 @@ impl ParserHandler for RendererState<'_> {
 
             Block::TableHeaderCell(TableCellDetail { alignment }) | Block::TableCell(TableCellDetail { alignment }) => {
                 self.current_table_cell = Vec::new();
-                // Store alignment
                 let col_idx = self.current_table_row.len();
                 if col_idx < self.table_alignments.len() {
                     self.table_alignments[col_idx] = alignment;
@@ -503,14 +779,14 @@ impl ParserHandler for RendererState<'_> {
             BlockType::Document => {}
 
             BlockType::Paragraph => {
-                self.finish_line();
+                let indent = if self.in_list { self.list_depth * self.theme.list_indent } else { 0 };
+                self.finish_line_with_wrap(indent);
                 if self.options.paragraph_space && !self.in_list {
                     self.add_blank_line();
                 }
             }
 
             BlockType::Heading => {
-                // Record heading info
                 if let Some(level) = self.in_heading.take() {
                     let text: String = self.current_spans.iter().map(|s| s.content.to_string()).collect();
                     self.headings.push(HeadingInfo {
@@ -534,9 +810,8 @@ impl ParserHandler for RendererState<'_> {
             }
 
             BlockType::Code => {
-                self.finish_line();
+                self.render_code_block();
                 self.in_code_block = false;
-                self.code_block_lang.clear();
                 self.pop_style();
                 if self.options.code_block_space {
                     self.add_blank_line();
@@ -557,7 +832,6 @@ impl ParserHandler for RendererState<'_> {
 
             BlockType::ListItem => {
                 self.finish_line();
-                // Increment counter for ordered lists
                 if let Some(counter) = self.list_counters.last_mut() {
                     *counter += 1;
                 }
@@ -588,7 +862,6 @@ impl ParserHandler for RendererState<'_> {
                 self.current_table_row.push(std::mem::take(&mut self.current_table_cell));
             }
 
-            // Handle any future variants
             _ => {}
         }
         true
@@ -618,7 +891,6 @@ impl ParserHandler for RendererState<'_> {
             }
             Span::Image(ImageDetail { src, title }) => {
                 self.push_style(self.theme.image);
-                // Render as [alt](src)
                 let alt_text = if title.is_empty() { "image" } else { &title };
                 self.push_text(&format!("[{}]", alt_text));
                 if !src.is_empty() {
@@ -631,7 +903,6 @@ impl ParserHandler for RendererState<'_> {
             }
             Span::WikiLink(WikiLinkDetail { target }) => {
                 self.push_style(self.theme.wiki_link);
-                // Store as link
                 self.links.push(LinkInfo {
                     line: self.lines.len(),
                     url: target.clone(),
@@ -646,7 +917,6 @@ impl ParserHandler for RendererState<'_> {
     fn leave_span(&mut self, span_type: SpanType) -> bool {
         match span_type {
             SpanType::Link => {
-                // Record link info
                 if let Some(detail) = self.current_link.take() {
                     self.links.push(LinkInfo {
                         line: self.lines.len(),
@@ -655,7 +925,6 @@ impl ParserHandler for RendererState<'_> {
                         is_autolink: detail.is_autolink,
                     });
 
-                    // Optionally show URL
                     if self.theme.show_link_urls && !detail.href.is_empty() {
                         self.pop_style();
                         self.current_spans
@@ -678,8 +947,6 @@ impl ParserHandler for RendererState<'_> {
             | SpanType::WikiLink => {
                 self.pop_style();
             }
-
-            // Handle any future variants
             _ => {
                 self.pop_style();
             }
@@ -693,19 +960,24 @@ impl ParserHandler for RendererState<'_> {
                 self.push_text(text);
             }
             TextType::HardBreak => {
-                self.finish_line();
-                // Add indent for continued list items
-                if self.in_list && self.list_depth > 0 {
-                    let indent = " ".repeat(self.list_depth * self.theme.list_indent);
-                    self.current_spans.push(RSpan::raw(indent));
+                if self.in_code_block {
+                    self.code_block_content.push('\n');
+                } else {
+                    self.finish_line();
+                    if self.in_list && self.list_depth > 0 {
+                        let indent = " ".repeat(self.list_depth * self.theme.list_indent);
+                        self.current_spans.push(RSpan::raw(indent));
+                    }
                 }
             }
             TextType::SoftBreak => {
-                // Treat as space
-                self.push_text(" ");
+                if self.in_code_block {
+                    self.code_block_content.push('\n');
+                } else {
+                    self.push_text(" ");
+                }
             }
             TextType::Entity => {
-                // Render entity literally (could decode common ones)
                 self.current_spans
                     .push(RSpan::styled(text.to_string(), self.theme.html_entity));
             }
@@ -716,8 +988,6 @@ impl ParserHandler for RendererState<'_> {
             TextType::NullChar => {
                 self.push_text("\u{FFFD}");
             }
-
-            // Handle any future variants
             _ => {
                 self.push_text(text);
             }
@@ -751,10 +1021,8 @@ pub fn render<'a>(
 ) -> RenderedMarkdown<'a> {
     let mut state = RendererState::new(theme, options);
 
-    // Parse and render
     let _ = parse(markdown, options.parser_flags, &mut state);
 
-    // Ensure last line is finished
     state.finish_line();
 
     let line_count = state.lines.len();
@@ -764,6 +1032,7 @@ pub fn render<'a>(
         links: state.links,
         headings: state.headings,
         line_count,
+        search_matches: state.search_matches,
     }
 }
 
@@ -823,7 +1092,30 @@ mod tests {
             &Theme::default(),
             &RenderOptions::github(),
         );
-        // Table renders with borders
         assert!(result.text.lines.len() >= 3);
+    }
+
+    #[test]
+    fn test_word_wrap() {
+        let long_text = "This is a very long line that should be wrapped when the width is set.";
+        let options = RenderOptions::default().with_width(20);
+        let result = render(long_text, &Theme::default(), &options);
+        // Should have multiple lines due to wrapping
+        assert!(result.text.lines.len() > 1);
+    }
+
+    #[test]
+    fn test_search_highlighting() {
+        let options = RenderOptions::default().with_search("hello");
+        let result = render("Hello world, hello there!", &Theme::default(), &options);
+        // Should find 2 matches (case-insensitive)
+        assert_eq!(result.search_matches.len(), 2);
+    }
+
+    #[test]
+    fn test_search_no_matches() {
+        let options = RenderOptions::default().with_search("xyz");
+        let result = render("Hello world", &Theme::default(), &options);
+        assert_eq!(result.search_matches.len(), 0);
     }
 }
